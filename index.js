@@ -39,6 +39,16 @@ const TOOL_TYPE_MAP = {
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
+const LINK_RESOLUTION_PARAM = {
+  type: 'string',
+  enum: ['auto', 'all', 'none'],
+  description:
+    'Google result links beyond the top 3 may come back as google.com/goto redirects. ' +
+    '"auto" (default): top 3 resolved, any leftover goto links get a search_id for resolve_links. ' +
+    '"all": also resolve every link now (free, but adds ~30 s when goto links are present). ' +
+    '"none": fastest, links exactly as Google returns them.',
+};
+
 const TOOLS = [
   {
     name: 'search_web',
@@ -58,6 +68,7 @@ const TOOLS = [
         autocorrect: { type: 'boolean', description: 'Auto-correct query spelling. Default: true.', default: true },
         summary:     { type: 'boolean', description: 'Request Serper AI summary. Default: false.', default: false },
         page:        { type: 'number',  description: 'Pagination page (starts at 1). Default: 1.', minimum: 1, default: 1 },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
     },
@@ -73,6 +84,7 @@ const TOOLS = [
         country:     { type: 'string',  description: 'Country code. Default: "US".' },
         search_lang: { type: 'string',  description: 'Language code. Default: "en".' },
         safesearch:  { type: 'string',  description: '"off" | "moderate" | "strict". Default: "moderate".', enum: ['off','moderate','strict'], default: 'moderate' },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
     },
@@ -88,6 +100,7 @@ const TOOLS = [
         country:     { type: 'string',  description: 'Country code. Default: "US".' },
         freshness:   { type: 'string',  description: 'Time filter.', enum: ['pd','pw','pm','py'] },
         safesearch:  { type: 'string',  description: '"off" | "moderate" | "strict". Default: "moderate".', enum: ['off','moderate','strict'], default: 'moderate' },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
     },
@@ -103,6 +116,7 @@ const TOOLS = [
         country:     { type: 'string',  description: 'Country code. Default: "US".' },
         freshness:   { type: 'string',  description: 'Default "pd" (past day).', enum: ['pd','pw','pm','py'], default: 'pd' },
         safesearch:  { type: 'string',  description: '"off" | "moderate" | "strict". Default: "moderate".', enum: ['off','moderate','strict'], default: 'moderate' },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
     },
@@ -116,6 +130,7 @@ const TOOLS = [
         query:       { type: 'string',  description: 'Product or shopping query.' },
         num_results: { type: 'number',  description: 'Results to return (1–20, default 10).', minimum: 1, maximum: 20, default: 10 },
         country:     { type: 'string',  description: 'Country code. Default: "US".' },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
     },
@@ -165,8 +180,24 @@ const TOOLS = [
         max_chunk_words: { type: 'number',  description: 'Max words per chunk (default 200).', minimum: 50, maximum: 1000, default: 200 },
         include_paa:     { type: 'boolean', description: 'Include People Also Ask chunks. Default: true.', default: true },
         output_format:   { type: 'string',  description: '"json" (vector DB) or "text" (prompt use). Default: "json".', enum: ['json','text'], default: 'json' },
+        link_resolution: LINK_RESOLUTION_PARAM,
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'resolve_links',
+    description:
+      'Turn google.com/goto redirect links from a recent search into real URLs via Serper /resolve ' +
+      '(free, 0 credits). Pass the search_id a search result asked for, or a list of goto links. ' +
+      'Right after a search this takes ~30 s; links not ready within max_wait_seconds stay goto links.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        search_id:        { type: 'string', description: 'search_id shown in a search result that still had goto links.' },
+        links:            { type: 'array', items: { type: 'string' }, description: 'google.com/goto?url=… links to resolve (alternative to search_id).' },
+        max_wait_seconds: { type: 'number', description: 'Keep retrying until this many seconds have passed (default 60).', minimum: 0, maximum: 300, default: 60 },
+      },
     },
   },
 ];
@@ -187,6 +218,7 @@ async function serperSearch(query, searchType, opts = {}, apiKey) {
   if (opts.safesearch === 'off')    body.safe = 'off';
   if (opts.summary)    body.summary = true;
   if (opts.page > 1)   body.page    = opts.page;
+  if (opts.link_resolution === 'none') body.resolveLinks = false;
 
   const res = await fetch(url, {
     method: 'POST',
@@ -198,6 +230,169 @@ async function serperSearch(query, searchType, opts = {}, apiKey) {
     throw new Error(`Serper API ${res.status}: ${msg}`);
   }
   return res.json();
+}
+
+// ── Google link resolution (/resolve) ────────────────────────────────────────
+//
+// Since 2026-10-30 Google only lets the first few result links of a fresh
+// results page be followed. Serper resolves the top 3; the rest may come back
+// as https://www.google.com/goto?url=… links, which hit Google's "Verifying
+// your request" page if opened right away. POST the search response (or
+// {"links": [...]}) to /resolve (0 credits) to get real URLs back. Links that
+// are not ready yet stay goto links and the response carries `retryAfter`
+// (seconds). See https://serper.dev/google-links.
+
+const RESOLVE_ENDPOINT = 'https://google.serper.dev/resolve';
+const GOTO_RE = /^https?:\/\/(www\.)?google\.[a-z.]+\/goto\?/i;
+const LINK_MODES = ['auto', 'all', 'none'];
+
+const envInt = (name, dflt) => {
+  const v = parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
+};
+const RESOLVE_MAX_WAIT_S   = envInt('SERPER_RESOLVE_MAX_WAIT', 60);
+const RESOLVE_HTTP_TIMEOUT = 120_000;
+const DEFAULT_LINK_MODE    = LINK_MODES.includes(process.env.SERPER_LINK_RESOLUTION)
+  ? process.env.SERPER_LINK_RESOLUTION : 'auto';
+
+const isGotoLink = (s) => typeof s === 'string' && GOTO_RE.test(s);
+
+function countGotoLinks(node) {
+  if (typeof node === 'string') return isGotoLink(node) ? 1 : 0;
+  if (Array.isArray(node)) return node.reduce((n, x) => n + countGotoLinks(x), 0);
+  if (node && typeof node === 'object') return Object.values(node).reduce((n, x) => n + countGotoLinks(x), 0);
+  return 0;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * POST `payload` (a search response or {links:[...]}) to /resolve, re-sending
+ * the partially resolved response after `retryAfter` until every goto link is
+ * resolved or the next retry would pass `maxWaitS`.
+ * Returns { data, unresolved, retryAfter, attempts }. `unresolved` > 0 means
+ * some links are still goto links; `retryAfter` is Serper's last hint.
+ */
+async function serperResolve(payload, apiKey, maxWaitS = RESOLVE_MAX_WAIT_S) {
+  const deadline = Date.now() + maxWaitS * 1000;
+  let current = payload;
+  for (let attempts = 1; ; attempts++) {
+    const { retryAfter: _r, credits: _c, ...body } = current;
+    const res = await fetch(RESOLVE_ENDPOINT, {
+      method: 'POST',
+      headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(RESOLVE_HTTP_TIMEOUT),
+    });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(`Serper /resolve ${res.status}: ${msg}`);
+    }
+    const out = await res.json();
+    const unresolved = countGotoLinks(out);
+    const retryAfter = typeof out.retryAfter === 'number' ? out.retryAfter : null;
+    if (!unresolved || retryAfter === null || Date.now() + retryAfter * 1000 > deadline) {
+      return { data: out, unresolved, retryAfter: unresolved ? retryAfter : null, attempts };
+    }
+    await sleep(retryAfter * 1000);
+    current = out;
+  }
+}
+
+async function resolveLinksTool(args, apiKey) {
+  const maxWait = Math.min(Math.max(Number(args.max_wait_seconds ?? RESOLVE_MAX_WAIT_S) || 0, 0), 300);
+  const hasId = typeof args.search_id === 'string' && args.search_id.trim() !== '';
+  const hasLinks = Array.isArray(args.links) && args.links.length > 0;
+  if (hasId === hasLinks) {
+    throw new McpError(ErrorCode.InvalidParams, 'pass exactly one of search_id or links');
+  }
+
+  if (hasLinks) {
+    const links = args.links.map(String);
+    const r = await serperResolve({ links }, apiKey, maxWait);
+    const out = r.data.links ?? [];
+    const lines = [`## 🔗 Resolved links (${links.length - r.unresolved}/${links.length})\n`];
+    links.forEach((l, i) => {
+      const real = out[i] ?? l;
+      lines.push(isGotoLink(real) ? `${i + 1}. ⏳ not resolved yet: ${l}` : `${i + 1}. ${real}`);
+    });
+    if (r.unresolved) lines.push(`\n${r.unresolved} still unresolved${r.retryAfter ? `; Serper suggests retrying in ${r.retryAfter} s` : ''}.`);
+    return lines.join('\n');
+  }
+
+  const id = args.search_id.trim();
+  const entry = searchCache.get(id);
+  if (!entry) {
+    throw new McpError(ErrorCode.InvalidParams,
+      `unknown search_id "${id}" (expired or from an earlier server process); re-run the search or pass links`);
+  }
+  const before = countGotoLinks(entry.data);
+  const r = await serperResolve(entry.data, apiKey, maxWait);
+  entry.data = { ...r.data, credits: entry.data.credits };
+  if (!r.unresolved) searchCache.delete(id);
+
+  const defaultNum = entry.searchType === 'places' ? 5 : 10;
+  const status = `> Resolved ${before - r.unresolved} of ${before} Google redirect link(s) (free; ${r.attempts} /resolve call(s)).\n\n`;
+  const body = formatResults(entry.data, entry.maxResults ?? defaultNum, entry.searchType);
+  return status + body + unresolvedNote({ unresolved: r.unresolved, searchId: r.unresolved ? id : null, retryAfter: r.retryAfter });
+}
+
+// Recent searches that still contain goto links, so `resolve_links` can finish
+// them later without the caller re-sending the raw response.
+const SEARCH_CACHE_MAX = 50;
+const searchCache = new Map();
+let searchSeq = 0;
+
+function cacheSearch(entry) {
+  const id = `s${++searchSeq}`;
+  searchCache.set(id, entry);
+  while (searchCache.size > SEARCH_CACHE_MAX) searchCache.delete(searchCache.keys().next().value);
+  return id;
+}
+
+/**
+ * Search, then apply the link-resolution mode:
+ *   auto — Serper's default (top 3 resolved); leftover goto links are cached
+ *          under a search_id for `resolve_links`.
+ *   all  — also call /resolve now (free, ~30 s right after a search).
+ *   none — send resolveLinks:false (lowest latency, links as Google returns).
+ * Never fails the search because /resolve failed; the error is reported.
+ */
+async function searchWithResolution(query, searchType, opts, apiKey) {
+  const mode = LINK_MODES.includes(opts.link_resolution) ? opts.link_resolution : DEFAULT_LINK_MODE;
+  let data = await serperSearch(query, searchType, { ...opts, link_resolution: mode }, apiKey);
+  const res = { data, unresolved: countGotoLinks(data), retryAfter: null, resolveError: null, searchId: null, mode };
+
+  if (mode === 'all' && res.unresolved) {
+    try {
+      const r = await serperResolve(data, apiKey);
+      res.data = { ...r.data, credits: data.credits };
+      res.unresolved = r.unresolved;
+      res.retryAfter = r.retryAfter;
+    } catch (err) {
+      res.resolveError = err.message;
+    }
+  }
+  if (res.unresolved) {
+    res.searchId = cacheSearch({ data: res.data, searchType, maxResults: opts.num_results, query });
+  }
+  return res;
+}
+
+function unresolvedNote({ unresolved, searchId, retryAfter, resolveError }) {
+  if (!unresolved) return '';
+  const parts = [
+    `\n\n> ⚠️ **${unresolved} link(s) in this response are Google redirects** (\`google.com/goto?…\`), not real URLs. ` +
+    'Opening them right after the search lands on Google\'s "Verifying your request" page.',
+  ];
+  if (resolveError) parts.push(`> /resolve failed: ${resolveError}`);
+  if (searchId) {
+    parts.push(
+      `> Call \`resolve_links\` with \`search_id: "${searchId}"\` to get the real URLs ` +
+      `(free, ~30 s after the search${retryAfter ? `; Serper suggested retrying in ${retryAfter} s` : ''}).`
+    );
+  }
+  return parts.join('\n');
 }
 
 // ── Formatter ────────────────────────────────────────────────────────────────
@@ -326,6 +521,17 @@ class SerperMCPServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args } = req.params;
+
+      if (name === 'resolve_links') {
+        try {
+          const text = await resolveLinksTool(args ?? {}, this.apiKey);
+          return { content: [{ type: 'text', text }] };
+        } catch (err) {
+          if (err instanceof McpError) throw err;
+          throw new McpError(ErrorCode.InternalError, `Resolve failed: ${err.message}`);
+        }
+      }
+
       const searchType = TOOL_TYPE_MAP[name];
       if (!searchType && name !== 'deep_research' && name !== 'search_rag_context') {
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
@@ -350,9 +556,9 @@ class SerperMCPServer {
           return { content: [{ type: 'text', text }] };
         }
 
-        const data = await serperSearch(query.trim(), searchType, args, this.apiKey);
+        const r = await searchWithResolution(query.trim(), searchType, args ?? {}, this.apiKey);
         const defaultNum = searchType === 'places' ? 5 : 10;
-        const text = formatResults(data, args?.num_results ?? defaultNum, searchType);
+        const text = formatResults(r.data, args?.num_results ?? defaultNum, searchType) + unresolvedNote(r);
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         throw new McpError(ErrorCode.InternalError, `Search failed: ${err.message}`);
@@ -397,7 +603,11 @@ Options:
   --api-key <key>    Serper API key (or SERPER_API_KEY env)
   --help             Show this help
 
-Tools: search_web · search_images · search_videos · search_news · search_shopping · search_places · deep_research · search_rag_context
+Tools: search_web · search_images · search_videos · search_news · search_shopping · search_places · deep_research · search_rag_context · resolve_links
+
+Environment:
+  SERPER_LINK_RESOLUTION   default link_resolution mode: auto | all | none (default auto)
+  SERPER_RESOLVE_MAX_WAIT  seconds to keep retrying /resolve in "all" mode (default 60)
 
 Get a free API key at https://serper.dev
 Docs: https://github.com/smjahid012/serper-search-mcp-server
@@ -502,8 +712,8 @@ async function deepResearch(query, depth = 'standard', country = 'US', apiKey) {
   const searches = await Promise.all(
     subQueries.map(async sq => {
       try {
-        const res = await serperSearch(sq, 'web', { num_results: r, country }, apiKey);
-        return { sq, results: res.organic ?? [] };
+        const res = await searchWithResolution(sq, 'web', { num_results: r, country, link_resolution: 'all' }, apiKey);
+        return { sq, results: res.data.organic ?? [] };
       } catch { return { sq, results: [] }; }
     })
   );
@@ -564,7 +774,8 @@ async function buildRAGContext(query, opts, apiKey) {
     max_chunk_words = 200, include_paa = true, output_format = 'json',
   } = opts;
 
-  const data = await serperSearch(query, 'web', { num_results, country, freshness, autocorrect: true }, apiKey);
+  const sr = await searchWithResolution(query, 'web', { num_results, country, freshness, autocorrect: true, link_resolution: opts.link_resolution }, apiKey);
+  const data = sr.data;
   const organic = data.organic ?? [];
 
   const chunks = [];
@@ -590,6 +801,12 @@ async function buildRAGContext(query, opts, apiKey) {
 
   const totalWords = chunks.reduce((s, c) => s + c.word_count, 0);
   const result = { query, total_sources: organic.length, total_chunks: chunks.length, total_words: totalWords, chunks };
+  if (sr.unresolved) {
+    result.unresolved_links = sr.unresolved;
+    result.search_id = sr.searchId;
+    result.note = 'Some URLs are google.com/goto redirects; call resolve_links with search_id to get real URLs.';
+    if (sr.resolveError) result.resolve_error = sr.resolveError;
+  }
 
   if (output_format === 'text') {
     const lines = [`# RAG Context: "${query}"`, `Sources: ${result.total_sources} | Chunks: ${result.total_chunks} | Words: ${result.total_words}`, ''];
@@ -597,7 +814,7 @@ async function buildRAGContext(query, opts, apiKey) {
       lines.push(`--- Chunk ${c.chunk_index + 1} | Source ${c.source_index || 'PAA'} | ${c.domain}${c.date ? ` | ${c.date}` : ''} ---`);
       lines.push(`Title: ${c.title}\nURL: ${c.url}\n${c.text}\n`);
     }
-    return lines.join('\n');
+    return lines.join('\n') + unresolvedNote(sr);
   }
 
   return JSON.stringify(result, null, 2);

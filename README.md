@@ -228,6 +228,33 @@ Returns: business name, category, address, phone, website, star rating + review 
 | `OPENROUTER_MODEL` | ❌ | `google/gemini-3.1-flash-lite:free` | OpenRouter model override |
 | `GEMINI_API_KEY` | ❌ | — | LLM key for `deep_research` (free at ai.google.dev) |
 | `GEMINI_MODEL` | ❌ | `gemini-3.1-flash-lite` | Gemini model override |
+| `SERPER_LINK_RESOLUTION` | ❌ | `auto` | Default `link_resolution` mode: `auto`, `all` or `none` |
+| `SERPER_RESOLVE_MAX_WAIT` | ❌ | `60` | Seconds to keep retrying `/resolve` before returning leftover redirect links |
+
+---
+
+## Google redirect links and `resolve_links`
+
+Since 2026-10-30, Google lets only the first few result links of a fresh results page be followed. Serper resolves the top 3; further links can come back as `https://www.google.com/goto?url=…` redirects. Opening one right after the search lands on Google's "Verifying your request" page instead of the website. See [serper.dev/google-links](https://serper.dev/google-links).
+
+Serper's `/resolve` endpoint turns a search response back into real URLs. It costs 0 credits; right after a search it takes about 30 seconds, and links that are not ready yet come back with a `retryAfter` hint.
+
+`search_web`, `search_news`, `search_images`, `search_videos`, `search_shopping` and `search_rag_context` take a `link_resolution` parameter:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` (default) | Serper's default: top 3 resolved. If redirect links remain, the result says how many and gives a `search_id`. |
+| `all` | Also calls `/resolve` before returning, retrying until `SERPER_RESOLVE_MAX_WAIT`. Adds ~20–30 s when redirects are present, nothing otherwise. |
+| `none` | Sends `resolveLinks: false`: lowest latency, every link as Google returns it. |
+
+`resolve_links` finishes the job later:
+
+```jsonc
+{ "search_id": "s1" }                                    // re-formatted results with real URLs
+{ "links": ["https://www.google.com/goto?url=CAES…"] }   // one resolved URL per input
+```
+
+Search IDs live in memory for the last 50 searches with leftover redirects and are lost when the server restarts. `deep_research` always resolves (`all`), so its citations carry real URLs. If `/resolve` fails, the search still returns, with the error and the remaining redirect count in the result.
 
 ---
 
@@ -402,6 +429,11 @@ serper-search-mcp-server/
 ---
 
 ## Changelog
+
+### Unreleased — Google redirect links
+- ➕ **`resolve_links` tool** — resolves `google.com/goto` redirect links via Serper `/resolve` (free), by `search_id` or a list of links
+- ➕ **`link_resolution` param** (`auto` / `all` / `none`) on web, news, images, videos, shopping and RAG search
+- 🔧 Results with leftover redirect links say so and give a `search_id`; `deep_research` resolves before citing
 
 ### v3.0.0 — Places + Deep Research + RAG
 - ➕ **`search_places` tool** — local businesses with address, phone, hours, GPS
