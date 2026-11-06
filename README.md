@@ -229,7 +229,7 @@ Returns: business name, category, address, phone, website, star rating + review 
 | `GEMINI_API_KEY` | ❌ | — | LLM key for `deep_research` (free at ai.google.dev) |
 | `GEMINI_MODEL` | ❌ | `gemini-3.1-flash-lite` | Gemini model override |
 | `SERPER_LINK_RESOLUTION` | ❌ | `auto` | Default `link_resolution` mode: `auto`, `all` or `none` |
-| `SERPER_RESOLVE_MAX_WAIT` | ❌ | `60` | Seconds to keep retrying `/resolve` before returning leftover redirect links |
+| `SERPER_RESOLVE_MAX_WAIT` | ❌ | `60` | Time budget (s) for retrying `/resolve` when Serper says to wait |
 
 ---
 
@@ -243,18 +243,20 @@ Serper's `/resolve` endpoint turns a search response back into real URLs. It cos
 
 | Mode | Behaviour |
 |---|---|
-| `auto` (default) | Serper's default: top 3 resolved. If redirect links remain, the result says how many and gives a `search_id`. |
-| `all` | Also calls `/resolve` before returning, retrying until `SERPER_RESOLVE_MAX_WAIT`. Adds ~20–30 s when redirects are present, nothing otherwise. |
+| `auto` (default) | Serper's default: top 3 resolved. If shown results still contain redirect links, the result says how many and gives a `search_id`. |
+| `all` | Also calls `/resolve` before returning. Adds ~20–30 s when shown results contain redirects, nothing otherwise. |
 | `none` | Sends `resolveLinks: false`: lowest latency, every link as Google returns it. |
 
 `resolve_links` finishes the job later:
 
 ```jsonc
-{ "search_id": "s1" }                                    // re-formatted results with real URLs
+{ "search_id": "3fa9c1-1" }                              // re-formatted results with real URLs
 { "links": ["https://www.google.com/goto?url=CAES…"] }   // one resolved URL per input
 ```
 
-Search IDs live in memory for the last 50 searches with leftover redirects and are lost when the server restarts. `deep_research` always resolves (`all`), so its citations carry real URLs. If `/resolve` fails, the search still returns, with the error and the remaining redirect count in the result.
+Links that are not ready stay redirects, and Serper suggests a wait (often 90 s). The server retries only if that wait fits in `max_wait_seconds` / `SERPER_RESOLVE_MAX_WAIT` (default 60), so with defaults it makes one call and tells you to call again later.
+
+Search IDs live in memory for the last 50 searches with leftover redirects; they carry a per-process prefix, so an ID from before a server restart is rejected rather than matched to another search. `deep_research` always resolves (`all`) and lists any citation that is still a redirect. If `/resolve` fails or returns a malformed reply, the search still returns its original results, with the error in the result.
 
 ---
 
